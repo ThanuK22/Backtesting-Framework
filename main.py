@@ -1,144 +1,202 @@
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
+from typing import Optional, List, Dict
 
 class MovingAverageCrossStrategy:
     """
-    SMA crossover:
-      1 = buy signal, -1 = sell signal, 0 = no new signal.
+    Simple SMA crossover strategy:
+      +1 = go long,
+       0 = hold/flat,
+      -1 = exit long (go flat).
     """
-    def __init__(self, short_window=40, long_window=100):
+    def __init__(self, short_window: int = 40, long_window: int = 100):
         self.short_window = short_window
         self.long_window  = long_window
 
     def generate_signals(self, data: pd.DataFrame) -> pd.Series:
-        # zero signal by default
         signals = pd.Series(0, index=data.index)
-
-        # rolling SMAs
-        short_sma = data['Close'].rolling(self.short_window, min_periods=1).mean()
-        long_sma  = data['Close'].rolling(self.long_window,  min_periods=1).mean()
-
-        #  1 when short > long, -1 when short < long
-        signals[short_sma > long_sma] =  1
+        short_sma = data['Close'].rolling(window=self.short_window, min_periods=1).mean()
+        long_sma  = data['Close'].rolling(window=self.long_window,  min_periods=1).mean()
+        signals[short_sma > long_sma] = 1
         signals[short_sma < long_sma] = -1
-
-        # only act on changes
+        # Only act on changes: +1 = enter, -1 = exit
         return signals.diff().fillna(0).astype(int)
 
 class Backtest:
     """
-    Backtester with commission/slippage, metrics, trade‐count, and plots.
+    Backtesting engine with:
+      - Any signal-based strategy
+      - Commission & slippage modeling
+      - Fixed-fraction position sizing
+      - Optional stop-loss & take-profit
+      - Performance metrics: CAGR, Sharpe, Sortino, Calmar, Max Drawdown
+      - Trade log
+      - Plots: price+signals, equity curve, drawdown
     """
-    def __init__(self, data: pd.DataFrame, strategy: MovingAverageCrossStrategy,
-                 initial_capital: float = 100_000,
-                 commission: float    = 0.002,
-                 slippage: float      = 0.0005):
-        self.data            = data.copy()
-        self.strategy        = strategy
+    def __init__(
+        self,
+        data: pd.DataFrame,
+        strategy: MovingAverageCrossStrategy,
+        initial_capital: float = 100_000,
+        commission: float = 0.002,
+        slippage: float = 0.0005,
+        percent_per_trade: float = 1.0,
+        stop_loss: Optional[float] = None,
+        take_profit: Optional[float] = None
+    ):
+        self.data = data.copy()
+        self.strategy = strategy
         self.initial_capital = initial_capital
-        self.commission      = commission
-        self.slippage        = slippage
+        self.commission = commission
+        self.slippage = slippage
+        self.percent = percent_per_trade
+        self.stop_loss = stop_loss
+        self.take_profit = take_profit
 
     def run(self):
-        # generate entry/exit signals
-        self.signals = self.strategy.generate_signals(self.data)
+        signals = self.strategy.generate_signals(self.data)
 
-        # count total trades
-        n_trades = int(self.signals.abs().sum())
-        print(f"Total trades signalled: {n_trades}")
-        if n_trades == 0:
-            print("⚠️  Warning: no trades were generated. "
-                  "Try smaller SMA windows or more data.")
-
-        # init portfolio dataframe
+        # Initialize portfolio DataFrame
         port = pd.DataFrame(index=self.data.index)
-        port['signal']    = self.signals
+        port['signal'] = signals
         port['positions'] = 0
-        port['cash']      = self.initial_capital
-        port['holdings']  = 0.0
-        port['total']     = self.initial_capital
+        port['cash'] = float(self.initial_capital)
+        port['holdings'] = 0.0
+        port['total'] = float(self.initial_capital)
 
-        pos  = 0
+        position = 0
         cash = self.initial_capital
+        entry_price = None
+        trade_log: List[Dict] = []
 
-        # simulate
-        for date, sig in self.signals.items():
+        for date, sig in signals.items():
             price = self.data.at[date, 'Close']
+            equity = cash + position * price
 
-            # ENTER long
-            if sig == 1 and pos == 0:
-                qty  = cash // (price * (1 + self.commission) + self.slippage * price)
-                cost = qty * price * (1 + self.commission) + self.slippage * qty * price
-                pos  = qty
-                cash -= cost
+            # Entry signal
+            if sig == 1 and position == 0:
+                allocation = equity * self.percent
+                qty = int(allocation // (price * (1 + self.commission) + self.slippage * price))
+                if qty > 0:
+                    cost = qty * price * (1 + self.commission) + qty * price * self.slippage
+                    cash -= cost
+                    position = qty
+                    entry_price = price
+                    trade_log.append({
+                        'Entry Date': date,
+                        'Entry Price': price,
+                        'Qty': qty
+                    })
 
-            # EXIT long
-            elif sig == -1 and pos > 0:
-                proceeds = pos * price * (1 - self.commission) - self.slippage * pos * price
-                cash    += proceeds
-                pos      = 0
+            # Exit signal or stop-loss / take-profit
+            exit_cond = (
+                (sig == -1 and position > 0) or
+                (position > 0 and self.stop_loss is not None and price <= entry_price * (1 - self.stop_loss)) or
+                (position > 0 and self.take_profit is not None and price >= entry_price * (1 + self.take_profit))
+            )
+            if exit_cond and position > 0:
+                proceeds = position * price * (1 - self.commission) - position * price * self.slippage
+                cash += proceeds
+                trade_log[-1].update({
+                    'Exit Date': date,
+                    'Exit Price': price,
+                    'Return': (price - entry_price) / entry_price
+                })
+                position = 0
+                entry_price = None
 
-            holdings = pos * price
-            total    = cash + holdings
+            holdings = position * price
+            total = cash + holdings
 
-            port.at[date, 'positions'] = pos
-            port.at[date, 'cash']      = cash
-            port.at[date, 'holdings']  = holdings
-            port.at[date, 'total']     = total
+            port.at[date, 'positions'] = position
+            port.at[date, 'cash'] = cash
+            port.at[date, 'holdings'] = holdings
+            port.at[date, 'total'] = total
 
-        # performance
+        # Compute performance metrics
         port['returns'] = port['total'].pct_change().fillna(0)
-        r_mean = port['returns'].mean()
-        r_std  = port['returns'].std()
+        days = len(port)
+        final_eq = port['total'].iloc[-1]
+        cagr = (final_eq / self.initial_capital)**(252 / days) - 1
 
-        if r_std > 0:
-            sharpe = np.sqrt(252) * r_mean / r_std
-        else:
-            sharpe = np.nan
+        ann_vol = port['returns'].std() * np.sqrt(252)
+        sharpe = (port['returns'].mean() * np.sqrt(252) / port['returns'].std()
+                  if port['returns'].std() > 0 else np.nan)
 
-        cummax   = port['total'].cummax()
+        neg_returns = port['returns'][port['returns'] < 0]
+        sortino = (port['returns'].mean() * np.sqrt(252) / neg_returns.std()
+                   if len(neg_returns) > 0 and neg_returns.std() > 0 else np.nan)
+
+        cummax = port['total'].cummax()
         drawdown = (port['total'] - cummax) / cummax
-        max_dd   = drawdown.min()
+        max_dd = drawdown.min()
+        calmar = (cagr / abs(max_dd)) if max_dd < 0 else np.nan
 
-        # plot
-        fig, (ax1, ax2) = plt.subplots(2,1, sharex=True, figsize=(12,8))
+        stats = {
+            'CAGR': cagr,
+            'Annual Vol': ann_vol,
+            'Sharpe': sharpe,
+            'Sortino': sortino,
+            'Max Drawdown': max_dd,
+            'Calmar': calmar,
+            'Total Trades': len(trade_log)
+        }
 
-        # price + markers
-        ax1.plot(self.data.index, self.data['Close'], label='Close')
-        buys  = self.signals == 1
-        sells = self.signals == -1
-        ax1.plot(self.data.index[buys],  self.data['Close'][buys],  '^', markersize=10, label='Buy')
-        ax1.plot(self.data.index[sells], self.data['Close'][sells], 'v', markersize=10, label='Sell')
-        ax1.set_ylabel('Price')
-        ax1.legend()
+        trades_df = pd.DataFrame(trade_log)
 
-        # equity curve
-        ax2.plot(port.index, port['total'], label='Equity Curve')
-        ax2.set_ylabel('Portfolio Value')
-        ax2.set_xlabel('Date')
-        ax2.legend()
+        # Plot results
+        fig, axes = plt.subplots(3, 1, sharex=True, figsize=(12, 12))
+
+        # Price + signals
+        axes[0].plot(self.data.index, self.data['Close'], label='Close Price')
+        buys = signals == 1
+        sells = signals == -1
+        axes[0].plot(self.data.index[buys], self.data['Close'][buys], '^', markersize=8, label='Buy')
+        axes[0].plot(self.data.index[sells], self.data['Close'][sells], 'v', markersize=8, label='Sell')
+        axes[0].set_ylabel('Price')
+        axes[0].legend()
+
+        # Equity curve
+        axes[1].plot(port.index, port['total'], label='Equity Curve')
+        axes[1].set_ylabel('Equity')
+        axes[1].legend()
+
+        # Drawdown
+        axes[2].fill_between(port.index, drawdown, 0, color='gray')
+        axes[2].set_ylabel('Drawdown')
+        axes[2].set_xlabel('Date')
 
         plt.tight_layout()
         plt.show()
 
-        return {'Sharpe Ratio': sharpe, 'Max Drawdown': max_dd}, port
+        return stats, port, trades_df
 
 if __name__ == "__main__":
-    # load your data
-    df = pd.read_csv('data/stock_data.csv', index_col=0, parse_dates=True)
+    # Load your complex OHLCV dataset
+    df = pd.read_csv('data/more_trades_stock_data.csv', index_col=0, parse_dates=True)
 
-    # for a short sample, use smaller windows
-    strat = MovingAverageCrossStrategy(short_window=3, long_window=5)
-
+    # Configure strategy & backtester
+    strategy = MovingAverageCrossStrategy(short_window=10, long_window=30)
     backtester = Backtest(
         data=df,
-        strategy=strat,
+        strategy=strategy,
         initial_capital=100_000,
         commission=0.001,
-        slippage=0.0002
+        slippage=0.0002,
+        percent_per_trade=0.5,   # 50% of equity per trade
+        stop_loss=0.05,          # 5% stop-loss
+        take_profit=0.10         # 10% take-profit
     )
 
-    stats, portfolio = backtester.run()
-    print(f"Sharpe Ratio: {stats['Sharpe Ratio']}")
-    print(f"Max Drawdown: {stats['Max Drawdown']:.2%}")
+    stats, portfolio, trades = backtester.run()
+
+    print("Performance Metrics:")
+    for k, v in stats.items():
+        if isinstance(v, float):
+            print(f"  {k}: {v:.4f}")
+        else:
+            print(f"  {k}: {v}")
+
+    print("\nTrade Log:")
+    print(trades)
